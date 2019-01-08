@@ -1,4 +1,4 @@
-package org.apache.rocketmq.namesrv.yunai;
+package org.apache.rocketmq.namesrv;
 
 /**
  * Created by yunai on 2017/4/15.
