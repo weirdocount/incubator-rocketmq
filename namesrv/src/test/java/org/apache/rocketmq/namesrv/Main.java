@@ -59,8 +59,7 @@ public class Main {
                     "\t\tdefault:\n" +
                     "\t\t\tthrow new RuntimeException(\"unknown status!\");\n" +
                     "\t\t}\n" +
-                    "\t}" + "\n"
-            ;
+                    "\t}" + "\n";
 
     public static void main(String[] args) {
         int i = 1;

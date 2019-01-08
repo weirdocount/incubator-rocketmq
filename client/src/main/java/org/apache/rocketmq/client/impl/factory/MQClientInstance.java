@@ -16,12 +16,40 @@
  */
 package org.apache.rocketmq.client.impl.factory;
 
+import java.io.UnsupportedEncodingException;
+import java.net.DatagramSocket;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.Random;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
 import org.apache.rocketmq.client.ClientConfig;
 import org.apache.rocketmq.client.admin.MQAdminExtInner;
 import org.apache.rocketmq.client.exception.MQBrokerException;
 import org.apache.rocketmq.client.exception.MQClientException;
-import org.apache.rocketmq.client.impl.*;
-import org.apache.rocketmq.client.impl.consumer.*;
+import org.apache.rocketmq.client.impl.ClientRemotingProcessor;
+import org.apache.rocketmq.client.impl.FindBrokerResult;
+import org.apache.rocketmq.client.impl.MQAdminImpl;
+import org.apache.rocketmq.client.impl.MQClientAPIImpl;
+import org.apache.rocketmq.client.impl.MQClientManager;
+import org.apache.rocketmq.client.impl.consumer.DefaultMQPullConsumerImpl;
+import org.apache.rocketmq.client.impl.consumer.DefaultMQPushConsumerImpl;
+import org.apache.rocketmq.client.impl.consumer.MQConsumerInner;
+import org.apache.rocketmq.client.impl.consumer.ProcessQueue;
+import org.apache.rocketmq.client.impl.consumer.PullMessageService;
+import org.apache.rocketmq.client.impl.consumer.RebalanceService;
 import org.apache.rocketmq.client.impl.producer.DefaultMQProducerImpl;
 import org.apache.rocketmq.client.impl.producer.MQProducerInner;
 import org.apache.rocketmq.client.impl.producer.TopicPublishInfo;
@@ -37,7 +65,11 @@ import org.apache.rocketmq.common.message.MessageExt;
 import org.apache.rocketmq.common.message.MessageQueue;
 import org.apache.rocketmq.common.protocol.body.ConsumeMessageDirectlyResult;
 import org.apache.rocketmq.common.protocol.body.ConsumerRunningInfo;
-import org.apache.rocketmq.common.protocol.heartbeat.*;
+import org.apache.rocketmq.common.protocol.heartbeat.ConsumeType;
+import org.apache.rocketmq.common.protocol.heartbeat.ConsumerData;
+import org.apache.rocketmq.common.protocol.heartbeat.HeartbeatData;
+import org.apache.rocketmq.common.protocol.heartbeat.ProducerData;
+import org.apache.rocketmq.common.protocol.heartbeat.SubscriptionData;
 import org.apache.rocketmq.common.protocol.route.BrokerData;
 import org.apache.rocketmq.common.protocol.route.QueueData;
 import org.apache.rocketmq.common.protocol.route.TopicRouteData;
@@ -47,15 +79,6 @@ import org.apache.rocketmq.remoting.exception.RemotingException;
 import org.apache.rocketmq.remoting.netty.NettyClientConfig;
 import org.apache.rocketmq.remoting.protocol.RemotingCommand;
 import org.slf4j.Logger;
-
-import java.io.UnsupportedEncodingException;
-import java.net.DatagramSocket;
-import java.util.*;
-import java.util.Map.Entry;
-import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.locks.Lock;
-import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * MQClient对象
@@ -163,10 +186,10 @@ public class MQClientInstance {
         this.consumerStatsManager = new ConsumerStatsManager(this.scheduledExecutorService);
 
         log.info("created a new client Instance, FactoryIndex: {} ClinetID: {} {} {}, serializeType={}", //
-            this.instanceIndex, //
-            this.clientId, //
-            this.clientConfig, //
-            MQVersion.getVersionDesc(MQVersion.CURRENT_VERSION), RemotingCommand.getSerializeTypeConfigInThisServer());
+                this.instanceIndex, //
+                this.clientId, //
+                this.clientConfig, //
+                MQVersion.getVersionDesc(MQVersion.CURRENT_VERSION), RemotingCommand.getSerializeTypeConfigInThisServer());
     }
 
     /**
@@ -480,7 +503,8 @@ public class MQClientInstance {
     }
 
     /**
-     * 更新单个 Topic 路由信息
+     * 更新单个 Topic 路由信息，会同步到本地缓存{@link DefaultMQProducerImpl#topicPublishInfoTable}
+     *
      * @param topic Topic
      * @return 是否更新成功
      */
@@ -542,7 +566,7 @@ public class MQClientInstance {
                                 log.error("send heart beat to broker exception", e);
                             } else {
                                 log.info("send heart beat to broker[{} {} {}] exception, because the broker not up, forget it", brokerName,
-                                    id, addr);
+                                        id, addr);
                             }
                         }
                     }
@@ -579,11 +603,12 @@ public class MQClientInstance {
     }
 
     /**
-     * 更新单个 Topic 路由信息
+     * 获取或更新单个 Topic 路由信息
      * 如 isDefault=true && defaultMQProducer!=null 时，使用{@link DefaultMQProducer#createTopicKey}
+     * 其他时候则获取
      *
-     * @param topic Topic
-     * @param isDefault 是否默认
+     * @param topic             Topic
+     * @param isDefault         是否默认
      * @param defaultMQProducer producer
      * @return 是否更新成功
      */
@@ -593,12 +618,12 @@ public class MQClientInstance {
                 try {
                     TopicRouteData topicRouteData;
                     if (isDefault && defaultMQProducer != null) { // 使用默认TopicKey获取TopicRouteData。
-                                                                  // 当broker开启自动创建topic开关时，会使用MixAll.DEFAULT_TOPIC进行创建。
-                                                                  // 当producer的createTopic为MixAll.DEFAULT_TOPIC时，则可以获得TopicRouteData。
-                                                                  // 目的：用于新的topic，发送消息时，未创建路由信息，先使用createTopic的路由信息，等到发送到broker时，进行自动创建。
-                                                                  // @see TopicConfigManager
+                        // 当broker开启自动创建topic开关时，会使用MixAll.DEFAULT_TOPIC进行创建。
+                        // 当producer的createTopic为MixAll.DEFAULT_TOPIC时，则可以获得TopicRouteData。
+                        // 目的：用于新的topic，发送消息时，未创建路由信息，先使用createTopic的路由信息，等到发送到broker时，进行自动创建。
+                        // @see TopicConfigManager
                         topicRouteData = this.mQClientAPIImpl.getDefaultTopicRouteInfoFromNameServer(defaultMQProducer.getCreateTopicKey(),
-                            1000 * 3);
+                                1000 * 3);
                         if (topicRouteData != null) {
                             for (QueueData data : topicRouteData.getQueueDatas()) {
                                 int queueNums = Math.min(defaultMQProducer.getDefaultTopicQueueNums(), data.getReadQueueNums());
@@ -607,6 +632,7 @@ public class MQClientInstance {
                             }
                         }
                     } else {
+                        //从NameServer获取topci的路由信息
                         topicRouteData = this.mQClientAPIImpl.getTopicRouteInfoFromNameServer(topic, 1000 * 3);
                     }
                     if (topicRouteData != null) {
@@ -726,14 +752,14 @@ public class MQClientInstance {
     /**
      * 上传过滤类到Filtersrv
      *
-     * @param consumerGroup 消费分组
-     * @param fullClassName 类名
-     * @param topic Topic
+     * @param consumerGroup     消费分组
+     * @param fullClassName     类名
+     * @param topic             Topic
      * @param filterClassSource 过滤类源码文件地址
      * @throws UnsupportedEncodingException 当读取源码文件失败
      */
     private void uploadFilterClassToAllFilterServer(final String consumerGroup, final String fullClassName, final String topic,
-        final String filterClassSource) throws UnsupportedEncodingException {
+                                                    final String filterClassSource) throws UnsupportedEncodingException {
         byte[] classBody = null;
         int classCRC = 0;
         try {
@@ -741,13 +767,13 @@ public class MQClientInstance {
             classCRC = UtilAll.crc32(classBody);
         } catch (Exception e1) {
             log.warn("uploadFilterClassToAllFilterServer Exception, ClassName: {} {}", //
-                fullClassName, //
-                RemotingHelper.exceptionSimpleDesc(e1));
+                    fullClassName, //
+                    RemotingHelper.exceptionSimpleDesc(e1));
         }
 
         TopicRouteData topicRouteData = this.topicRouteTable.get(topic);
         if (topicRouteData != null //
-            && topicRouteData.getFilterServerTable() != null && !topicRouteData.getFilterServerTable().isEmpty()) {
+                && topicRouteData.getFilterServerTable() != null && !topicRouteData.getFilterServerTable().isEmpty()) {
             Iterator<Entry<String, List<String>>> it = topicRouteData.getFilterServerTable().entrySet().iterator();
             while (it.hasNext()) {
                 Entry<String, List<String>> next = it.next();
@@ -755,10 +781,10 @@ public class MQClientInstance {
                 for (final String fsAddr : value) {
                     try {
                         this.mQClientAPIImpl.registerMessageFilterClass(fsAddr, consumerGroup, topic, fullClassName, classCRC, classBody,
-                            5000);
+                                5000);
 
                         log.info("register message class filter to {} OK, ConsumerGroup: {} Topic: {} ClassName: {}", fsAddr, consumerGroup,
-                            topic, fullClassName);
+                                topic, fullClassName);
 
                     } catch (Exception e) {
                         log.error("uploadFilterClassToAllFilterServer Exception", e);
@@ -767,7 +793,7 @@ public class MQClientInstance {
             }
         } else {
             log.warn("register message class filter failed, because no filter server, ConsumerGroup: {} Topic: {} ClassName: {}",
-                consumerGroup, topic, fullClassName);
+                    consumerGroup, topic, fullClassName);
         }
     }
 
@@ -870,7 +896,7 @@ public class MQClientInstance {
      * 注册Consumer
      * 如果已经存在group对应的consumer，则注册失败
      *
-     * @param group 消费分组
+     * @param group    消费分组
      * @param consumer consumer
      * @return 是否成功
      */
@@ -938,7 +964,7 @@ public class MQClientInstance {
      * 注册Producer
      * 若之前创建过，则返回失败；否则，成功。
      *
-     * @param group 分组
+     * @param group    分组
      * @param producer producer
      * @return 是否成功。
      */
@@ -1054,15 +1080,15 @@ public class MQClientInstance {
     /**
      * 获得Broker信息
      *
-     * @param brokerName broker名字
-     * @param brokerId broker编号
+     * @param brokerName     broker名字
+     * @param brokerId       broker编号
      * @param onlyThisBroker 是否必须是该broker
      * @return Broker信息
      */
     public FindBrokerResult findBrokerAddressInSubscribe(//
-        final String brokerName, //
-        final long brokerId, //
-        final boolean onlyThisBroker//
+                                                         final String brokerName, //
+                                                         final long brokerId, //
+                                                         final boolean onlyThisBroker//
     ) {
         String brokerAddr = null; // broker地址
         boolean slave = false; // 是否为从节点
@@ -1122,7 +1148,7 @@ public class MQClientInstance {
      * 获取 Topic 对应的 Broker地址
      *
      * @param topic Topic
-     * @return  Broker地址
+     * @return Broker地址
      */
     public String findBrokerAddrByTopic(final String topic) {
         TopicRouteData topicRouteData = this.topicRouteTable.get(topic);
@@ -1234,8 +1260,8 @@ public class MQClientInstance {
     }
 
     public ConsumeMessageDirectlyResult consumeMessageDirectly(final MessageExt msg, //
-        final String consumerGroup, //
-        final String brokerName) {
+                                                               final String consumerGroup, //
+                                                               final String brokerName) {
         MQConsumerInner mqConsumerInner = this.consumerTable.get(consumerGroup);
         if (null != mqConsumerInner) {
             DefaultMQPushConsumerImpl consumer = (DefaultMQPushConsumerImpl) mqConsumerInner;
@@ -1265,7 +1291,7 @@ public class MQClientInstance {
         consumerRunningInfo.getProperties().put(ConsumerRunningInfo.PROP_NAMESERVER_ADDR, nsAddr);
         consumerRunningInfo.getProperties().put(ConsumerRunningInfo.PROP_CONSUME_TYPE, mqConsumerInner.consumeType().name());
         consumerRunningInfo.getProperties().put(ConsumerRunningInfo.PROP_CLIENT_VERSION,
-            MQVersion.getVersionDesc(MQVersion.CURRENT_VERSION));
+                MQVersion.getVersionDesc(MQVersion.CURRENT_VERSION));
 
         return consumerRunningInfo;
     }
